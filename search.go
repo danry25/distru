@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+const (
+	matchThreshold = 0.75 //Amount that a word must resemble a term to be a match
+)
+
 //resultContainer is used to contain an array of pages so that they can be sorted.
 type resultContainer struct {
 	Pages []*page
@@ -28,7 +32,7 @@ func (c *resultContainer) Swap(i, j int) {
 }
 
 //Conf.Search returns the total number of results, and a []*page containing at most maxResults number of results. It returns all of the terms searched on, (omitting duplicates.)
-func (conf *config) Search(terms []string) (results []*page, filteredTerms []string) {
+func (conf *config) Search(terms []string) (results []*page) {
 	index := conf.Idx
 
 	//Filter duplicate results through the use of maps.
@@ -36,17 +40,27 @@ func (conf *config) Search(terms []string) (results []*page, filteredTerms []str
 	for i := range terms {
 		termsMap[terms[i]] = nil
 	}
-	filteredTerms = make([]string, 0, len(termsMap))
-	for k := range termsMap {
-		filteredTerms = append(filteredTerms, k)
-	}
 
-	wordScore := uint64(0xffff / len(filteredTerms))
+	wordScore := uint64(0xffff / len(termsMap))
 
-	//Request indexes from all resources,
-	//and trust their results.
-	for i := range conf.Resources {
-		index.MergeRemote(conf.Resources[i], true, conf.ResTimeout)
+	if len(conf.Resources) > 0 {
+		//Request indexes from all resources,
+		//and trust their results. This is
+		//done concurrently.
+		workChan := make(chan bool)
+		workers := len(conf.Resources)
+		for _, resource := range conf.Resources {
+			go func(resource string, workChan chan<- bool) {
+				index.MergeRemote(resource, true, conf.ResTimeout)
+				workChan <- true
+			}(resource, workChan)
+		}
+		for _ = range workChan {
+			workers--
+			if workers == 0 {
+				close(workChan)
+			}
+		}
 	}
 
 	bareresults := make(map[string]*page)
@@ -56,37 +70,61 @@ func (conf *config) Search(terms []string) (results []*page, filteredTerms []str
 			//of the word for a particular page. The number
 			//is currently discarded, because we can't rank
 			//the relevance of pages.
-			for _, term := range filteredTerms {
-				instances, isPresent := vv.WordCount[term]
-				if isPresent {
-					//We set the time here so we
-					//can put them in the cache
-					//later.
-					if _, isFoundAlready := bareresults[kk]; !isFoundAlready {
-						//If not already there, add it.
-						oldTime, err := time.Parse("ANSIC", vv.Time)
-						if err == nil {
+			for term := range termsMap {
+
+				//Determine the "amount" that the words
+				//match. This is determined by comparing
+				//letters and their position. The total
+				//score is the number of matches divided
+				//by the search term's length.
+				for w, c := range vv.WordCount {
+					var resemblance int
+					var longerTerm string
+					var shorterTerm string
+					if len(term) > len(w) {
+						longerTerm = term
+						shorterTerm = w
+					} else {
+						longerTerm = w
+						shorterTerm = term
+					}
+					//We must iterate over the shorter
+					//term, to avoid runtime errors.
+					for i := range shorterTerm {
+						if shorterTerm[i] == longerTerm[i] {
+							resemblance++
+						}
+					}
+					resemblanceM := float32(resemblance) / float32(len(longerTerm))
+					if resemblanceM >= matchThreshold {
+						if _, isFoundAlready := bareresults[kk]; !isFoundAlready {
+							//If not already there, add it.
+
 							//The multiplier will be:
 							//12 divided by the number of hours since
 							//the result was last used, capped at one
 							//This means that it will be at most 1,
 							//but only if the result is newer than
 							//twelve hours old.
-							multiplier := 12 / time.Since(oldTime).Hours()
-							if multiplier > 1 {
-								multiplier = 1
+							timeM := 12 / time.Since(time.Unix(vv.Time, 0)).Hours()
+							if timeM > 1 {
+								timeM = 1
 							}
-							if multiplier > 0 {
+							if timeM > 0 {
 								//If the multiplier is negative, then the
 								//timestamp is broken.
-								vv.relevance = uint64(float64(wordScore) * multiplier)
+								vv.relevance = uint64(float64(wordScore) * timeM)
 							}
-						}
-						vv.Time = time.Now().String()
+							//Factor in the resemblance
+							vv.relevance *= uint64(100 * resemblanceM)
 
-						bareresults[kk] = vv
-					} else {
-						bareresults[kk].relevance += wordScore * uint64(instances)
+							//And stamp it with the current time.
+							vv.Time = time.Now().Unix()
+
+							bareresults[kk] = vv
+						} else {
+							bareresults[kk].relevance += wordScore * uint64(c)
+						}
 					}
 				}
 			}
@@ -103,5 +141,5 @@ func (conf *config) Search(terms []string) (results []*page, filteredTerms []str
 	sort.Sort(c)
 
 	conf.Idx.Cache = append(conf.Idx.Cache, c.Pages...)
-	return c.Pages, filteredTerms
+	return c.Pages
 }

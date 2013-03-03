@@ -8,12 +8,14 @@ import (
 	"strings"
 )
 
-func ServeWeb() {
+var webDir string
+
+func ServeWeb(conf *config) {
 	http.HandleFunc("/search/", searchHandler)
 	http.HandleFunc("/", frontpageHandler)
+	webDir = conf.WebDir
 	log.Println("Started webserver on port 9048.")
 	http.ListenAndServe(":9048", nil)
-
 }
 
 func searchHandler(w http.ResponseWriter, r *http.Request) {
@@ -22,33 +24,27 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("<-" + r.RemoteAddr + "> searching \"" + searchTerms + "\"")
 
 	//Perform the search.
-	results, terms := Conf.Search(strings.Split(searchTerms, " "))
-
-	searchTerms = " "
-	for i := range terms {
-		//Redefine searchTerms with the filtered terms.
-		searchTerms += terms[i] + " "
-	}
+	results := Conf.Search(strings.Split(searchTerms, " "))
 
 	log.Println("<-"+r.RemoteAddr+"> results:", len(results))
 
 	//load external files
-	css, err := ioutil.ReadFile("ui/search.css")
+	css, err := ioutil.ReadFile(webDir + "/search.css")
 	if err != nil {
 		panic(err)
 	}
-	parseJS, err := ioutil.ReadFile("ui/parse.js")
+	parseJS, err := ioutil.ReadFile(webDir + "/parse.js")
 	if err != nil {
 		panic(err)
 	}
 
-	searchJS, err := ioutil.ReadFile("ui/search.js")
+	searchJS, err := ioutil.ReadFile(webDir + "/search.js")
 	if err != nil {
 		panic(err)
 	}
 
 	//add the page
-	w.Write([]byte("<html><head><title>Distru :: Searching" + searchTerms + "</title><div class = \"version\">" + Version + "</div><style type=\"text/css\">"))
+	w.Write([]byte("<html><head><title>Distru :: Searching " + searchTerms + "</title><div class = \"version\">" + Version + "</div><style type=\"text/css\">"))
 	w.Write(css)
 	w.Write([]byte("</style></head><body><div class =\"holder\"><div class=\"searchterm\">" + strconv.Itoa(len(results)) + " results for <span id=\"term\"><strong>" + searchTerms + "</strong></span><a href=\"/\" class=\"back\">Distru</a><input type=\"text\" onkeydown=\"searchThis();\" onkeypress=\"isEnter(event);\" id=\"search\" class=\"search\" placeholder=\"Search freely\"/></div></div><div id=\"blank\"></div><script type=\"text/javascript\">"))
 	w.Write(parseJS)
@@ -71,11 +67,11 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 
 func frontpageHandler(w http.ResponseWriter, r *http.Request) {
 	//load external files
-	css, err := ioutil.ReadFile("ui/index.css")
+	css, err := ioutil.ReadFile(webDir + "/index.css")
 	if err != nil {
 		panic(err)
 	}
-	javascript, err := ioutil.ReadFile("ui/search.js")
+	javascript, err := ioutil.ReadFile(webDir + "/search.js")
 	if err != nil {
 		panic(err)
 	}

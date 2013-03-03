@@ -5,6 +5,7 @@ import (
 	"github.com/temoto/robotstxt.go"
 	"github.com/zeebo/bencode"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -20,6 +21,12 @@ const (
 	AllowedType = "text/html"
 )
 
+//Sizes and limits
+const (
+	SiteExpiration = time.Hour
+	queueSize      = 64
+)
+
 var (
 	DisallowedExtensions = []string{".png", ".jpg", ".gif"}
 )
@@ -27,11 +34,12 @@ var (
 type Index struct {
 	Sites map[string]*site //A map of fully indexed webpages.
 	Cache []*page          //Pages that recently turned up in the search results
-	Queue chan string      `bencode:"-" json:"-"` //The channel which controls Indexers
+	Queue chan string      `bencode:"-"` //The channel which controls Indexers
+	mtn   bool             `bencode:"-"` //True if Maintain() is running for this Index
 }
 
 type site struct {
-	Time  string           //When the site finished indexing as Time.String()
+	Time  int64            //Unix time the site finished indexing as Time.String()
 	Pages map[string]*page //Nonordered map of pages on the server
 	Links []string         //List of all unique links collected from all pages on the site
 }
@@ -39,10 +47,10 @@ type site struct {
 type page struct {
 	Title       string         //The contents of the <title> tag
 	Description string         //The description of the page
-	Time        string         //The time that this page was either indexed or recieved from another instance
+	Time        int64          //Unix time that this page was either indexed or recieved from another instance
 	Link        string         //The fully qualified link to this page
 	WordCount   map[string]int //Counts for every plaintext word on the webpage
-	relevance   uint64         //Internal unitless measure of relevance to most recent search result
+	relevance   uint64         `bencode:"-"` //Internal unitless measure of relevance to most recent search result
 }
 
 //Index.MergeRemote makes a raw distru request for the JSON encoded index of the given site, (which must have a full URI.) It will not overwrite local sites with remote ones unless trustNew is true. Additionally, it will time out the connection, and not modify the Index, after the number of seconds given in timeout. (0 will cause it to use net.Dial() normally.) It returns nil if successful, or returns an error if the remote site could not be reached, or produced an invalid index.
@@ -88,16 +96,7 @@ func (index *Index) MergeRemote(remote string, trustNew bool, timeout int) (err 
 		//the remote index is trusted, *and* newer than the
 		//local one, add the remote site to the local index.
 		_, isPresent = index.Sites[k]
-		localTime, err := time.Parse("ANSIC", v.Time)
-		if err != nil {
-			continue
-		}
-		remoteTime, err := time.Parse("ANSIC", index.Sites[k].Time)
-		if !isPresent || err != nil {
-			index.Sites[k] = v
-			continue
-		}
-		if trustNew && remoteTime.Before(localTime) {
+		if !isPresent || (trustNew && time.Unix(index.Sites[k].Time, 0).Before(time.Unix(v.Time, 0))) {
 			index.Sites[k] = v
 			continue
 		}
@@ -107,6 +106,28 @@ func (index *Index) MergeRemote(remote string, trustNew bool, timeout int) (err 
 	return nil
 }
 
+//Save bencodes the Index to the given path. It returns any errors.
+func (index *Index) Save(path string) (err error) {
+	var s string
+	s, err = bencode.EncodeString(index)
+	if err != nil {
+		return
+	}
+	err = ioutil.WriteFile(path, []byte(s), 0600)
+	return
+}
+
+//LoadIndex reads a bencoded Index from the given path and returns a pointer to it.
+func LoadIndex(path string) (index *Index, err error) {
+	var b []byte
+	b, err = ioutil.ReadFile(path)
+	if err != nil {
+		return
+	}
+	err = bencode.DecodeString(string(b), &index)
+	return
+}
+
 //Writes a Bencoded stream to the provided io.Writer. (This can be a Conn object.)
 func (index *Index) Bencode(w io.Writer) error {
 	//Create an encoder for the io.Writer.
@@ -114,39 +135,76 @@ func (index *Index) Bencode(w io.Writer) error {
 	return enc.Encode(index)
 }
 
-//MaintainIndex launches a number of goroutines which handle indexing of sites in sequence. It sets index.Queue to a channel into which target urls should be placed. When a new string is added to the returned chan, one of the next non-busy indexer will remove it from the chan and index it, and add the contents to the passed index. It will then forget about that site.
-//To remove a site from the index, use delete(index.Sites, urlstring). To shut down the indexers, close() index.Queue.
-func MaintainIndex(index *Index, numIndexers int) {
-	//First, we're going to make the channel of pending sites.
-	index.Queue = make(chan string)
-
-	//Next, we're going to launch numIndexers amount of Indexers.
-	for i := 0; i < numIndexers; i++ {
-		go Indexer(index, index.Queue)
+//Maintain creates a ticker and launches a goroutine to call Update(). The minuteDelay is the number of minutes between calls. It does not invoke Update() immediately upon starting. To force the Index to update immediately, invoke it.
+func (index *Index) Maintain(indexFile string, minuteDelay int) {
+	//Protect against multiple calls to index.Maintain()
+	if index.mtn {
+		return
+	} else {
+		index.mtn = true
 	}
+
+	//First, we're going to make the channel of pending sites.
+	index.Queue = make(chan string, queueSize)
+	ticker := time.NewTicker(time.Minute * time.Duration(minuteDelay))
+
+	go func(ticker *time.Ticker) {
+		for _ = range ticker.C {
+			//Update() will perform the updates,
+			//then return true if it changed the
+			//Index at all.
+			if index.Update() {
+				err := index.Save(indexFile)
+				if err != nil {
+					log.Println("Error saving", indexFile, ":", err)
+				} else {
+					log.Println("Saved", indexFile)
+				}
+			}
+		}
+	}(ticker)
 }
 
-func Indexer(index *Index, pending <-chan string) {
-	for target := range pending {
+func (index *Index) Update() (changed bool) {
+	update := func(target string) {
 		log.Println("indexer> adding \"" + target + "\"")
 		newSite := newSite(target)
 		if newSite == nil {
 			//If we got an error for some reason,
 			log.Println("indexer> failed to add \"" + target + "\"")
 			//discard it and continue.
-			continue
+			return
 		}
 		//Update the target site.
 		index.Sites[target] = newSite
+		changed = true
 		log.Println("indexer> added \"" + target + "\"")
 	}
+
+	//Clear every item in the Queue
+	for len(index.Queue) > 0 {
+		target := <-index.Queue
+		update(target)
+	}
+
+	for link, site := range index.Sites {
+		age := time.Since(time.Unix(site.Time, 0))
+		if age > SiteExpiration {
+			log.Println("indexer> updating", age.Minutes(), "minute old site")
+			update(link)
+		}
+	}
+	return
 }
 
+//newSite completely indexes a site identified by a URL, which may be either fully qualified or not.
 func newSite(target string) *site {
-	target = "http://" + target
+	if !strings.HasPrefix(target, "http") {
+		target = "http://" + target
+	}
 
 	//Create an http.Client to control the webpage requests.
-	client := http.Client{}
+	client := *http.DefaultClient
 	//Use robotstxt to get the search engine permission.
 	rperm, _ := getRobotsPermission(target)
 
@@ -240,7 +298,7 @@ func newSite(target string) *site {
 	}
 
 	site := &site{
-		Time:  time.Now().String(),
+		Time:  time.Now().Unix(),
 		Pages: pages,
 		Links: linkArray,
 	}
